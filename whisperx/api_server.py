@@ -1,142 +1,398 @@
+import asyncio
+import base64
+import os
+import tempfile
+import time
 import uuid
-from typing import Union, List, Optional, Dict, Any
-from fastapi import FastAPI, Request, Response, Header, Body
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from fastapi import Body, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI()
 
-# In-memory storage for tasks (simulated database)
-TASKS: Dict[str, Dict[str, Any]] = {
-    "67ee89ba-7050-4c04-a3d7-ac61a63499b3": {
-        "status": "20000000",
-        "result": {
-            "text": "This is a simulated transcription for the example ID.",
-            "utterances": [
-                {"text": "This is a simulated", "start_time": 0, "end_time": 1000},
-                {"text": "transcription for the example ID.", "start_time": 1000, "end_time": 3000}
-            ]
-        }
-    }
-}
+ASR_STATUS_SUCCESS = "20000000"
+ASR_STATUS_PROCESSING = "20000001"
+ASR_STATUS_IN_QUEUE = "20000002"
+ASR_STATUS_NO_SPEECH = "20000003"
+
+ASR_STATUS_INVALID_PARAMS = "45000001"
+ASR_STATUS_SYSTEM_ERROR = "55000000"
+
+
+class SubmitUser(BaseModel):
+    uid: Optional[str] = None
+
+
+class SubmitAudio(BaseModel):
+    # 客户端会传 base64: requestData.audio.data
+    data: Optional[str] = None
+    # 兼容：如果未来改为传 URL
+    url: Optional[str] = None
+
+
+class SubmitRequest(BaseModel):
+    # 客户端字段名是 request.model_name（来自 SpeechToTextConfig.MODEL_NAME）
+    # 这里把它当作 whisper / faster-whisper 的模型名使用；不传则用默认值
+    model_name: Optional[str] = None
+
+    # 以下字段来自客户端，但本服务端暂不强依赖（保留以兼容）
+    enable_itn: Optional[bool] = None
+    enable_punc: Optional[bool] = None
+    enable_speaker_info: Optional[bool] = None
+    enable_ddc: Optional[bool] = None
+    show_utterances: Optional[bool] = None
+    enable_lid: Optional[bool] = None
+    context: Optional[str] = None
+
 
 class TaskSubmission(BaseModel):
-    # 根据实际需求定义请求体
-    # Define request body based on actual needs
-    audio_url: str = None
-    task_type: str = "transcribe"
+    user: Optional[SubmitUser] = None
+    audio: SubmitAudio
+    request: Optional[SubmitRequest] = None
+
+
+@dataclass
+class TaskState:
+    status_code: str
+    created_at: float
+    updated_at: float
+    request_id: Optional[str] = None
+    model_name: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+    error_message: Optional[str] = None
+
+
+# In-memory task store & queue (进程内；重启会丢失)
+TASKS: Dict[str, TaskState] = {}
+TASK_QUEUE: "asyncio.Queue[str]" = asyncio.Queue()
+
+# Lazy-loaded ASR pipeline（避免每个任务都重复加载模型）
+_PIPELINE = None
+_PIPELINE_MODEL_NAME: Optional[str] = None
+_PIPELINE_LOCK = asyncio.Lock()
+
+
+def _ms(seconds: float) -> int:
+    return int(round(seconds * 1000))
+
+
+def _make_result_payload(audio_duration_ms: int, text: str, utterances: List[Dict[str, Any]]):
+    return {
+        "audio_info": {"duration": audio_duration_ms},
+        "result": {
+            "additions": {"duration": audio_duration_ms},
+            "text": text,
+            "utterances": utterances,
+        },
+    }
+
+
+async def _ensure_pipeline(model_name: str):
+    """
+    初始化/复用 whisperx pipeline。
+    注意：load_model 会比较重，因此需要锁，且尽量复用。
+    """
+    global _PIPELINE, _PIPELINE_MODEL_NAME
+    async with _PIPELINE_LOCK:
+        if _PIPELINE is not None and _PIPELINE_MODEL_NAME == model_name:
+            return _PIPELINE
+
+        # 懒加载 whisperx 依赖：避免环境缺推理依赖时 API 服务无法启动
+        from whisperx.asr import load_model
+
+        # 默认用 CPU；如果环境有 CUDA 可用，whisperx 内部会用 torch 判断
+        device = "cuda" if os.environ.get("WHISPERX_DEVICE") == "cuda" else "cpu"
+        device_index = int(os.environ.get("WHISPERX_DEVICE_INDEX", "0"))
+        compute_type = os.environ.get("WHISPERX_COMPUTE_TYPE", "float16" if device == "cuda" else "int8")
+
+        _PIPELINE = load_model(
+            model_name,
+            device=device,
+            device_index=device_index,
+            compute_type=compute_type,
+            # 让 VAD 自己判断语音段；对“无语音”更稳
+            vad_method=os.environ.get("WHISPERX_VAD_METHOD", "pyannote"),
+        )
+        _PIPELINE_MODEL_NAME = model_name
+        return _PIPELINE
+
+
+def _run_transcribe_sync(model_name: str, audio_path: str) -> Dict[str, Any]:
+    """
+    运行转写（同步函数，便于扔到线程池里跑）。
+    返回符合客户端 ASRResponse 的 payload（成功 or 无语音）。
+    """
+    # 懒加载音频工具（依赖 ffmpeg CLI）
+    from whisperx.audio import SAMPLE_RATE, load_audio
+
+    audio = load_audio(audio_path)
+    duration_ms = _ms(float(audio.shape[0]) / float(SAMPLE_RATE))
+
+    # whisperx 的 pipeline.transcribe 返回 segments: [{start,end,text}, ...]
+    result = _PIPELINE.transcribe(audio, batch_size=8, chunk_size=30, verbose=False)
+    segments = result.get("segments") or []
+
+    # 简单的“无语音”判断：没有任何段，或拼接文本为空
+    full_text = "".join([(seg.get("text") or "") for seg in segments]).strip()
+    if not segments or not full_text:
+        return _make_result_payload(duration_ms or 1, "no speech detected", [
+            {"additions": {"speaker": "1"}, "start_time": 0, "end_time": max(duration_ms, 1), "text": "no speech detected"}
+        ])
+
+    utterances: List[Dict[str, Any]] = []
+    for seg in segments:
+        start_s = float(seg.get("start") or 0.0)
+        end_s = float(seg.get("end") or 0.0)
+        utterances.append({
+            "additions": {"speaker": "1"},
+            "start_time": _ms(start_s),
+            "end_time": _ms(end_s),
+            "text": (seg.get("text") or ""),
+        })
+
+    return _make_result_payload(duration_ms or 1, full_text, utterances)
+
+
+async def _task_worker():
+    """
+    后台任务 worker：从队列里取 task_id，跑转写，写回 TASKS。
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        task_id = await TASK_QUEUE.get()
+        state = TASKS.get(task_id)
+        if state is None:
+            TASK_QUEUE.task_done()
+            continue
+
+        try:
+            state.status_code = ASR_STATUS_PROCESSING
+            state.updated_at = time.time()
+
+            # 决定模型：优先使用 submit 时传入的 request.model_name
+            model_name = state.model_name or os.environ.get("WHISPERX_MODEL", "small")
+
+            # 任务里需要 audio_path；我们把它塞到 state.error_message 不合适
+            # 这里通过临时文件名约定：task_id -> tmp 文件路径（submit 时会设置）
+            tmp_path = getattr(state, "_tmp_audio_path", None)  # type: ignore[attr-defined]
+            if not tmp_path or not os.path.exists(tmp_path):
+                raise RuntimeError("audio file missing for task")
+
+            # 确保 pipeline 已加载（async）
+            await _ensure_pipeline(model_name)
+
+            payload = await loop.run_in_executor(
+                None,
+                _run_transcribe_sync,
+                model_name,
+                tmp_path,
+            )
+
+            # 根据 payload 是否为 no speech，返回不同业务码（客户端支持 20000003）
+            text = ((payload.get("result") or {}).get("text") or "").strip().lower()
+            if text == "no speech detected":
+                state.status_code = ASR_STATUS_NO_SPEECH
+            else:
+                state.status_code = ASR_STATUS_SUCCESS
+
+            state.result = payload
+            state.error_message = None
+            state.updated_at = time.time()
+
+        except Exception as e:
+            state.status_code = ASR_STATUS_SYSTEM_ERROR
+            state.error_message = str(e)
+            state.result = None
+            state.updated_at = time.time()
+        finally:
+            # 尽量清理临时文件
+            tmp_path = getattr(state, "_tmp_audio_path", None)  # type: ignore[attr-defined]
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            if tmp_path:
+                try:
+                    delattr(state, "_tmp_audio_path")  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            TASK_QUEUE.task_done()
+
+
+@app.on_event("startup")
+async def _startup():
+    # 启动一个后台 worker（需要更高吞吐可改多个 worker）
+    asyncio.create_task(_task_worker())
+
 
 @app.middleware("http")
 async def add_custom_headers(request: Request, call_next):
-    # 1. 生成或获取 Log ID
-    # Generate or get Log ID
+    """
+    统一补齐客户端依赖的响应头：
+    - X-Tt-Logid：如果 handler 已经设置，则不覆盖（submit 必须返回 taskId）
+    - X-Api-Status-Code / X-Api-Message：如果 handler 已设置，则不覆盖
+    """
     log_id = request.headers.get("X-Tt-Logid", str(uuid.uuid4()))
-    
     try:
         response = await call_next(request)
-        
-        # 2. 设置 X-Tt-Logid
-        # Set X-Tt-Logid
-        response.headers["X-Tt-Logid"] = log_id
-        
-        # 3. 设置状态码和消息
-        # Set status code and message
-        # 如果 endpoint 已经设置了 Status-Code，就不覆盖
+
+        if "X-Tt-Logid" not in response.headers:
+            response.headers["X-Tt-Logid"] = log_id
+
         if "X-Api-Status-Code" not in response.headers:
-            # 只有在 HTTP 状态码为 2xx 时才认为是业务成功 (20000000)
             if 200 <= response.status_code < 300:
-                response.headers["X-Api-Status-Code"] = "20000000"
+                response.headers["X-Api-Status-Code"] = ASR_STATUS_SUCCESS
                 response.headers["X-Api-Message"] = "OK"
             else:
-                # 其他情况视为失败
-                # Consider other cases as failure
-                response.headers["X-Api-Status-Code"] = "40000000" # 非 200 的默认错误码
+                response.headers["X-Api-Status-Code"] = "40000000"
                 response.headers["X-Api-Message"] = "Request Failed"
-        
-        # 确保 Message 存在
+
         if "X-Api-Message" not in response.headers:
-             if response.headers.get("X-Api-Status-Code") == "20000000":
-                 response.headers["X-Api-Message"] = "OK"
-             else:
-                 response.headers["X-Api-Message"] = "Error"
-            
+            response.headers["X-Api-Message"] = "OK" if response.headers.get("X-Api-Status-Code") == ASR_STATUS_SUCCESS else "Error"
+
         return response
-        
     except Exception as e:
-        # 捕获未处理的异常
-        # Catch unhandled exceptions
-        content = {"detail": str(e)}
-        response = JSONResponse(content=content, status_code=500)
-        
-        response.headers["X-Tt-Logid"] = log_id
-        response.headers["X-Api-Status-Code"] = "55000000" # 系统错误码
-        response.headers["X-Api-Message"] = str(e)
-        
-        return response
+        resp = JSONResponse(content={"detail": str(e)}, status_code=500)
+        resp.headers["X-Tt-Logid"] = log_id
+        resp.headers["X-Api-Status-Code"] = ASR_STATUS_SYSTEM_ERROR
+        resp.headers["X-Api-Message"] = str(e)
+        return resp
+
 
 @app.post("/submit")
 async def submit_task(
-    request: Request,
-    task: TaskSubmission,
-    x_api_request_id: str = Header(None, alias="X-Api-Request-Id")
+    response: Response,
+    payload: TaskSubmission,
+    x_api_request_id: Optional[str] = Header(None, alias="X-Api-Request-Id"),
 ):
-    # 使用 header 中的 ID 或者生成新的
-    task_id = x_api_request_id if x_api_request_id else str(uuid.uuid4())
-    
-    # 模拟提交任务的处理
-    # Simulate task submission processing
-    TASKS[task_id] = {
-        "status": "20000000", # 默认立即成功
-        "result": {
-            "text": "Simulated transcription result.",
-            "utterances": []
-        }
-    }
-    
-    return {"status": "success", "task_id": task_id}
+    """
+    提交异步语音转文字任务。
+    客户端只关心：
+    - 响应头 X-Api-Status-Code == 20000000
+    - 响应头 X-Tt-Logid 作为 taskId（后续 /query 带上）
+    """
+    if not payload.audio or not payload.audio.data:
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
+        response.headers["X-Api-Message"] = "Missing audio.data (base64)"
+        return {}
+
+    task_id = str(uuid.uuid4())
+    now = time.time()
+    model_name = (payload.request.model_name if payload.request and payload.request.model_name else None)
+    TASKS[task_id] = TaskState(
+        status_code=ASR_STATUS_IN_QUEUE,
+        created_at=now,
+        updated_at=now,
+        request_id=x_api_request_id,
+        model_name=model_name,
+        result=None,
+        error_message=None,
+    )
+
+    # decode base64 -> temp file
+    try:
+        audio_bytes = base64.b64decode(payload.audio.data, validate=False)
+    except Exception:
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
+        response.headers["X-Api-Message"] = "Invalid base64 in audio.data"
+        # 删除创建的 task
+        TASKS.pop(task_id, None)
+        return {}
+
+    fd, tmp_path = tempfile.mkstemp(prefix="whisperx_", suffix=".audio")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(audio_bytes)
+    except Exception as e:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        TASKS.pop(task_id, None)
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_SYSTEM_ERROR
+        response.headers["X-Api-Message"] = f"Failed to save audio: {e}"
+        return {}
+
+    # 把临时路径挂在 state 上（仅内部使用）
+    setattr(TASKS[task_id], "_tmp_audio_path", tmp_path)
+
+    # 立刻返回 taskId 到响应头，供客户端轮询
+    response.headers["X-Tt-Logid"] = task_id
+    response.headers["X-Api-Status-Code"] = ASR_STATUS_SUCCESS
+    response.headers["X-Api-Message"] = "OK"
+
+    await TASK_QUEUE.put(task_id)
+    return {}
+
 
 @app.post("/query")
 async def query_task(
     response: Response,
-    body: dict = Body(...), # 接收空 JSON
-    x_api_request_id: str = Header(None, alias="X-Api-Request-Id"),
-    x_api_resource_id: str = Header(None, alias="X-Api-Resource-Id"),
-    x_api_app_key: str = Header(None, alias="X-Api-App-Key"),
-    x_api_access_key: str = Header(None, alias="X-Api-Access-Key")
+    body: Dict[str, Any] = Body(...),  # 客户端会发 '{}'，这里保持兼容
+    x_tt_logid: Optional[str] = Header(None, alias="X-Tt-Logid"),
+    x_api_request_id: Optional[str] = Header(None, alias="X-Api-Request-Id"),
 ):
-    if not x_api_request_id:
-        response.headers["X-Api-Status-Code"] = "45000001" # 请求参数无效
-        response.headers["X-Api-Message"] = "Missing X-Api-Request-Id"
-        # 返回空 JSON 或错误信息，根据需求。用户说 "Response Body格式 ：JSON... result ... 仅当识别成功时填写"
+    """
+    查询任务状态：
+    - 20000000：成功（response body 带完整 ASRResponse）
+    - 20000001：处理中（body 空）
+    - 20000002：排队中（body 空）
+    - 20000003：无语音（body 仍返回 ASRResponse；客户端会用固定 NO_SPEECH）
+    其他：失败（body 空 + message）
+    """
+    del body
+
+    # 客户端按 taskId 传在 X-Tt-Logid
+    task_id = x_tt_logid or None
+    if not task_id:
+        # 兼容：如果没有 X-Tt-Logid，退回用 request_id 作为 key（不推荐）
+        task_id = x_api_request_id or None
+
+    if not task_id:
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
+        response.headers["X-Api-Message"] = "Missing X-Tt-Logid"
         return {}
 
-    task_data = TASKS.get(x_api_request_id)
-    
-    if not task_data:
-        response.headers["X-Api-Status-Code"] = "45000001" # 找不到任务也算参数无效或别的
+    state = TASKS.get(task_id)
+    if state is None:
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
         response.headers["X-Api-Message"] = "Task Not Found"
         return {}
 
-    status_code = task_data.get("status", "20000000")
-    response.headers["X-Api-Status-Code"] = status_code
-    
-    if status_code == "20000000":
+    response.headers["X-Api-Status-Code"] = state.status_code
+
+    if state.status_code == ASR_STATUS_SUCCESS:
         response.headers["X-Api-Message"] = "OK"
-        return {"result": task_data.get("result", {})}
-    elif status_code == "20000001":
+        return state.result or {}
+    if state.status_code == ASR_STATUS_NO_SPEECH:
+        response.headers["X-Api-Message"] = "No speech detected"
+        # 这里返回 payload 也行；客户端会优先用它或用自己的 NO_SPEECH
+        return state.result or {}
+    if state.status_code == ASR_STATUS_PROCESSING:
         response.headers["X-Api-Message"] = "Processing"
         return {}
-    elif status_code == "20000002":
+    if state.status_code == ASR_STATUS_IN_QUEUE:
         response.headers["X-Api-Message"] = "In Queue"
         return {}
-    else:
-        response.headers["X-Api-Message"] = "Failed"
-        return {}
+
+    # 失败
+    response.headers["X-Api-Message"] = state.error_message or "Failed"
+    return {}
+
 
 @app.get("/")
 async def root():
     return {"message": "WhisperX API Server is running"}
 
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
