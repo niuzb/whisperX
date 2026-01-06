@@ -203,6 +203,8 @@ class FasterWhisperPipeline(Pipeline):
     ) -> TranscriptionResult:
         if isinstance(audio, str):
             audio = load_audio(audio)
+        
+        logger.info(f"Transcribing audio with {len(audio)} samples")
 
         def data(audio, segments):
             for seg in segments:
@@ -227,6 +229,8 @@ class FasterWhisperPipeline(Pipeline):
             onset=self._vad_params["vad_onset"],
             offset=self._vad_params["vad_offset"],
         )
+        logger.info(f"VAD process finished, found {len(vad_segments)} segments")
+
         if self.tokenizer is None:
             language = language or self.detect_language(audio)
             task = task or "transcribe"
@@ -259,6 +263,7 @@ class FasterWhisperPipeline(Pipeline):
         batch_size = batch_size or self._batch_size
         total_segments = len(vad_segments)
         for idx, out in enumerate(self.__call__(data(audio, vad_segments), batch_size=batch_size, num_workers=num_workers)):
+            logger.debug(f"Processing segment {idx + 1}/{total_segments}")
             if print_progress:
                 base_progress = ((idx + 1) / total_segments) * 100
                 percent_complete = base_progress / 2 if combined_progress else base_progress

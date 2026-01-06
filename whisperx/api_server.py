@@ -13,6 +13,10 @@ from pydantic import BaseModel, Field
 
 app = FastAPI()
 
+from whisperx.log_utils import get_logger
+
+logger = get_logger(__name__)
+
 ASR_STATUS_SUCCESS = "20000000"
 ASR_STATUS_PROCESSING = "20000001"
 ASR_STATUS_IN_QUEUE = "20000002"
@@ -75,6 +79,102 @@ _PIPELINE_MODEL_NAME: Optional[str] = None
 _PIPELINE_LOCK = asyncio.Lock()
 
 
+def _parse_env_bool(value: Optional[str], default: bool) -> bool:
+    if value is None:
+        return default
+    v = value.strip().lower()
+    if v in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _parse_env_optional_int(value: Optional[str], default: Optional[int]) -> Optional[int]:
+    if value is None:
+        return default
+    v = value.strip()
+    if v == "":
+        return default
+    if v.lower() in {"none", "null"}:
+        return None
+    return int(v)
+
+
+def _parse_env_float(value: Optional[str], default: float) -> float:
+    if value is None:
+        return default
+    v = value.strip()
+    if v == "":
+        return default
+    return float(v)
+
+
+def _parse_env_optional_float(value: Optional[str], default: Optional[float]) -> Optional[float]:
+    if value is None:
+        return default
+    v = value.strip()
+    if v == "":
+        return default
+    if v.lower() in {"none", "null"}:
+        return None
+    return float(v)
+
+
+def _parse_env_optional_str(value: Optional[str], default: Optional[str]) -> Optional[str]:
+    if value is None:
+        return default
+    v = value.strip()
+    if v == "":
+        return None
+    if v.lower() in {"none", "null"}:
+        return None
+    return v
+
+
+def _parse_env_int_list(value: Optional[str], default: List[int]) -> List[int]:
+    if value is None:
+        return default
+    v = value.strip()
+    if v == "":
+        return default
+    parts = [p.strip() for p in v.split(",") if p.strip() != ""]
+    if not parts:
+        return default
+    return [int(p) for p in parts]
+
+
+def _build_asr_options_from_env() -> Dict[str, Any]:
+    temperature = _parse_env_float(os.environ.get("WHISPERX_TEMPERATURE"), 0.0)
+    increment = _parse_env_optional_float(
+        os.environ.get("WHISPERX_TEMPERATURE_INCREMENT_ON_FALLBACK"),
+        0.2,
+    )
+    if increment is not None:
+        steps = int(round((1.0 - float(temperature)) / float(increment)))
+        temperatures = [float(temperature) + (i * float(increment)) for i in range(max(steps, 0) + 1)]
+        if temperatures and temperatures[-1] < 1.0:
+            temperatures.append(1.0)
+        temperatures = [min(max(t, 0.0), 1.0) for t in temperatures]
+    else:
+        temperatures = [float(temperature)]
+
+    return {
+        "beam_size": _parse_env_optional_int(os.environ.get("WHISPERX_BEAM_SIZE"), 5),
+        "patience": _parse_env_float(os.environ.get("WHISPERX_PATIENCE"), 1.0),
+        "length_penalty": _parse_env_float(os.environ.get("WHISPERX_LENGTH_PENALTY"), 1.0),
+        "temperatures": temperatures,
+        "compression_ratio_threshold": _parse_env_optional_float(os.environ.get("WHISPERX_COMPRESSION_RATIO_THRESHOLD"), 2.4),
+        "log_prob_threshold": _parse_env_optional_float(os.environ.get("WHISPERX_LOGPROB_THRESHOLD"), -1.0),
+        "no_speech_threshold": _parse_env_optional_float(os.environ.get("WHISPERX_NO_SPEECH_THRESHOLD"), 0.6),
+        "condition_on_previous_text": False,
+        "initial_prompt": _parse_env_optional_str(os.environ.get("WHISPERX_INITIAL_PROMPT"), None),
+        "hotwords": _parse_env_optional_str(os.environ.get("WHISPERX_HOTWORDS"), None),
+        "suppress_tokens": _parse_env_int_list(os.environ.get("WHISPERX_SUPPRESS_TOKENS"), [-1]),
+        "suppress_numerals": _parse_env_bool(os.environ.get("WHISPERX_SUPPRESS_NUMERALS"), False),
+    }
+
+
 def _ms(seconds: float) -> int:
     return int(round(seconds * 1000))
 
@@ -108,6 +208,8 @@ async def _ensure_pipeline(model_name: str):
         device_index = int(os.environ.get("WHISPERX_DEVICE_INDEX", "0"))
         compute_type = os.environ.get("WHISPERX_COMPUTE_TYPE", "float16" if device == "cuda" else "int8")
 
+        asr_options = _build_asr_options_from_env()
+
         _PIPELINE = load_model(
             model_name,
             device=device,
@@ -115,6 +217,7 @@ async def _ensure_pipeline(model_name: str):
             compute_type=compute_type,
             # 让 VAD 自己判断语音段；对“无语音”更稳
             vad_method=os.environ.get("WHISPERX_VAD_METHOD", "pyannote"),
+            asr_options=asr_options,
         )
         _PIPELINE_MODEL_NAME = model_name
         return _PIPELINE
@@ -132,9 +235,9 @@ def _run_transcribe_sync(model_name: str, audio_path: str) -> Dict[str, Any]:
     duration_ms = _ms(float(audio.shape[0]) / float(SAMPLE_RATE))
 
     # whisperx 的 pipeline.transcribe 返回 segments: [{start,end,text}, ...]
-    result = _PIPELINE.transcribe(audio, batch_size=8, chunk_size=30, verbose=False)
+    result = _PIPELINE.transcribe(audio, batch_size=8, chunk_size=30, verbose=True)
     segments = result.get("segments") or []
-
+    logger.debug(f"Transcribed segments: {len(segments)}")
     # 简单的“无语音”判断：没有任何段，或拼接文本为空
     full_text = "".join([(seg.get("text") or "") for seg in segments]).strip()
     if not segments or not full_text:
@@ -161,14 +264,17 @@ async def _task_worker():
     后台任务 worker：从队列里取 task_id，跑转写，写回 TASKS。
     """
     loop = asyncio.get_running_loop()
+    logger.info("Task worker started")
     while True:
         task_id = await TASK_QUEUE.get()
         state = TASKS.get(task_id)
         if state is None:
+            logger.warning(f"Task {task_id} not found in state store")
             TASK_QUEUE.task_done()
             continue
 
         try:
+            logger.info(f"Processing task {task_id}")
             state.status_code = ASR_STATUS_PROCESSING
             state.updated_at = time.time()
 
@@ -182,6 +288,7 @@ async def _task_worker():
                 raise RuntimeError("audio file missing for task")
 
             # 确保 pipeline 已加载（async）
+            logger.info(f"Ensuring pipeline for model {model_name}")
             await _ensure_pipeline(model_name)
 
             payload = await loop.run_in_executor(
@@ -194,8 +301,10 @@ async def _task_worker():
             # 根据 payload 是否为 no speech，返回不同业务码（客户端支持 20000003）
             text = ((payload.get("result") or {}).get("text") or "").strip().lower()
             if text == "no speech detected":
+                logger.info(f"Task {task_id} finished: No speech detected")
                 state.status_code = ASR_STATUS_NO_SPEECH
             else:
+                logger.info(f"Task {task_id} finished successfully")
                 state.status_code = ASR_STATUS_SUCCESS
 
             state.result = payload
@@ -203,6 +312,7 @@ async def _task_worker():
             state.updated_at = time.time()
 
         except Exception as e:
+            logger.error(f"Task {task_id} failed: {e}", exc_info=True)
             state.status_code = ASR_STATUS_SYSTEM_ERROR
             state.error_message = str(e)
             state.result = None
@@ -282,7 +392,8 @@ async def submit_task(
 
     task_id = str(uuid.uuid4())
     now = time.time()
-    model_name = (payload.request.model_name if payload.request and payload.request.model_name else None)
+    # model_name = (payload.request.model_name if payload.request and payload.request.model_name else None)
+    model_name = "tiny"
     TASKS[task_id] = TaskState(
         status_code=ASR_STATUS_IN_QUEUE,
         created_at=now,
