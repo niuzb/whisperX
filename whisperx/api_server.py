@@ -6,15 +6,21 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from collections import defaultdict
 
 from fastapi import Body, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+# For Clustering
+import numpy as np
+from sklearn.cluster import DBSCAN
+
 app = FastAPI()
 
 from whisperx.log_utils import get_logger
-from whisperx.diarize import DiarizationPipeline, assign_word_speakers
+from whisperx.diarize import DiarizationPipeline, assign_word_speakers, SpeechEmbeddingPipeline
+from whisperx.audio import load_audio, SAMPLE_RATE
 
 logger = get_logger(__name__)
 
@@ -63,6 +69,18 @@ class TaskSubmission(BaseModel):
     request: Optional[SubmitRequest] = None
 
 
+class SpeakerSegment(BaseModel):
+    speaker: str
+    start_time: float
+    end_time: float
+
+
+class ExtractEmbeddingRequest(BaseModel):
+    audio: SubmitAudio
+    segments: List[SpeakerSegment]
+    min_duration: Optional[float] = 0.5
+
+
 @dataclass
 class TaskState:
     status_code: str
@@ -87,6 +105,9 @@ _PIPELINE_LOCK = asyncio.Lock()
 _DIARIZE_PIPELINE = None
 _DIARIZE_MODEL_NAME: Optional[str] = None
 _DIARIZE_LOCK = asyncio.Lock()
+
+_EMBEDDING_PIPELINE = None
+_EMBEDDING_LOCK = asyncio.Lock()
 
 
 def _parse_env_bool(value: Optional[str], default: bool) -> bool:
@@ -244,6 +265,21 @@ async def _ensure_diarize_pipeline(model_name: str, hf_token: str):
         _DIARIZE_PIPELINE = DiarizationPipeline(model_name=model_name, use_auth_token=hf_token, device=device)
         _DIARIZE_MODEL_NAME = model_name
         return _DIARIZE_PIPELINE
+
+
+async def _ensure_embedding_pipeline(hf_token: str):
+    global _EMBEDDING_PIPELINE
+    async with _EMBEDDING_LOCK:
+        if _EMBEDDING_PIPELINE is not None:
+            return _EMBEDDING_PIPELINE
+        
+        device = "cuda" if os.environ.get("WHISPERX_DEVICE") == "cuda" else "cpu"
+        _EMBEDDING_PIPELINE = SpeechEmbeddingPipeline(
+            model_name="pyannote/wespeaker-voxceleb-resnet34-LM",
+            use_auth_token=hf_token,
+            device=device
+        )
+        return _EMBEDDING_PIPELINE
 
 
 def _run_transcribe_sync(model_name: str, audio_path: str, diarize_params: Dict[str, Any]) -> Dict[str, Any]:
@@ -535,6 +571,197 @@ async def query_task(
     response.headers["X-Api-Message"] = state.error_message or "Failed"
     return {}
 
+
+@app.post("/extract_embeddings")
+async def extract_embeddings(
+    response: Response,
+    payload: ExtractEmbeddingRequest,
+):
+    """
+    Extract speaker embeddings from audio segments.
+    """
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
+        response.headers["X-Api-Message"] = "HF_TOKEN not configured"
+        return {}
+
+    if not payload.audio or not payload.audio.data:
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
+        response.headers["X-Api-Message"] = "Missing audio.data (base64)"
+        return {}
+
+    # Decode audio
+    try:
+        audio_bytes = base64.b64decode(payload.audio.data, validate=False)
+    except Exception:
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
+        response.headers["X-Api-Message"] = "Invalid base64 in audio.data"
+        return {}
+
+    # Save temp file
+    fd, tmp_path = tempfile.mkstemp(prefix="whisperx_embed_", suffix=".audio")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(audio_bytes)
+        
+        # Load audio using whisperx utility (which uses ffmpeg to load and resample)
+        # Returns numpy array (channels, samples) or (samples,)
+        # load_audio handles resampling to 16000
+        audio_np = load_audio(tmp_path)
+        
+    except Exception as e:
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_SYSTEM_ERROR
+        response.headers["X-Api-Message"] = f"Failed to process audio: {e}"
+        return {}
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    # Ensure pipeline
+    try:
+        pipeline = await _ensure_embedding_pipeline(hf_token)
+    except Exception as e:
+        logger.error(f"Failed to load embedding pipeline: {e}", exc_info=True)
+        response.headers["X-Api-Status-Code"] = ASR_STATUS_SYSTEM_ERROR
+        response.headers["X-Api-Message"] = f"Failed to load model: {e}"
+        return {}
+
+    # Identify overlapping regions to exclude
+    # A simple timeline mask of overlapping regions
+    # Discretize? No, float is fine.
+    # Sort segments by start time
+    sorted_segments = sorted(payload.segments, key=lambda x: x.start_time)
+    
+    # Find overlap intervals
+    overlaps = []
+    if len(sorted_segments) > 1:
+        # Check overlaps
+        # Basic sweep-line
+        events = []
+        for s in sorted_segments:
+            events.append((s.start_time, 1))
+            events.append((s.end_time, -1))
+        events.sort(key=lambda x: x[0])
+        
+        active_count = 0
+        start_overlap = None
+        
+        for t, change in events:
+            prev_active = active_count
+            active_count += change
+            
+            if prev_active < 2 and active_count >= 2:
+                # Started overlap
+                start_overlap = t
+            elif prev_active >= 2 and active_count < 2:
+                # Ended overlap
+                if start_overlap is not None:
+                    overlaps.append((start_overlap, t))
+                    start_overlap = None
+
+    # Group segments by speaker
+    speaker_segments = defaultdict(list)
+    for seg in payload.segments:
+        # Filter too short segments
+        if (seg.end_time - seg.start_time) < (payload.min_duration or 0.5):
+            continue
+        speaker_segments[seg.speaker].append(seg)
+
+    result_embeddings = {}
+
+    for speaker, segments in speaker_segments.items():
+        embeddings_list = []
+        
+        for seg in segments:
+            # Construct time intervals for this segment, subtracting overlaps
+            # Valid intervals = [seg.start, seg.end] - overlaps
+            # This is 1D boolean logic.
+            
+            # Start with the full segment
+            valid_intervals = [(seg.start_time, seg.end_time)]
+            
+            for o_start, o_end in overlaps:
+                new_intervals = []
+                for v_start, v_end in valid_intervals:
+                    # No overlap
+                    if o_end <= v_start or o_start >= v_end:
+                        new_intervals.append((v_start, v_end))
+                    else:
+                        # Overlap exists
+                        # Left part
+                        if v_start < o_start:
+                            new_intervals.append((v_start, o_start))
+                        # Right part
+                        if v_end > o_end:
+                            new_intervals.append((o_end, v_end))
+                valid_intervals = new_intervals
+            
+            # Process valid intervals
+            for v_start, v_end in valid_intervals:
+                if (v_end - v_start) < (payload.min_duration or 0.5):
+                    continue
+                
+                # Crop audio
+                start_sample = int(v_start * SAMPLE_RATE)
+                end_sample = int(v_end * SAMPLE_RATE)
+                
+                if end_sample > audio_np.shape[0]:
+                    end_sample = audio_np.shape[0]
+                if start_sample >= end_sample:
+                    continue
+                    
+                crop = audio_np[start_sample:end_sample]
+                try:
+                    emb = pipeline(crop)
+                    # emb shape is (1, dimension) or (dimension,) depending on pyannote version
+                    # Usually it's (dimension,) for a single embedding or (1, D)
+                    if isinstance(emb, np.ndarray):
+                        emb = emb.flatten()
+                        embeddings_list.append(emb)
+                except Exception as e:
+                    logger.warning(f"Failed to extract embedding for speaker {speaker}: {e}")
+
+        if not embeddings_list:
+            continue
+
+        # Clustering / Averaging
+        embeddings_matrix = np.array(embeddings_list)
+        
+        # If we have enough samples, use DBSCAN to filter outliers
+        # DBSCAN metric='cosine'. eps needs to be small enough (cosine distance)
+        # Cosine distance = 1 - cosine similarity. 
+        # Same speaker similarity is usually > 0.5 or 0.7. So distance < 0.3 or 0.5.
+        if len(embeddings_list) >= 3:
+            # eps=0.5 corresponds to similarity 0.5
+            clustering = DBSCAN(eps=0.5, min_samples=2, metric='cosine').fit(embeddings_matrix)
+            labels = clustering.labels_
+            
+            # Find largest cluster (excluding noise -1)
+            unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
+            
+            if len(unique_labels) > 0:
+                largest_cluster_label = unique_labels[np.argmax(counts)]
+                # Filter embeddings belonging to the largest cluster
+                embeddings_matrix = embeddings_matrix[labels == largest_cluster_label]
+            else:
+                # All noise? Fallback to mean of all
+                pass
+        
+        # Calculate mean embedding (centroid)
+        # Normalize first? Pyannote embeddings are usually unit normalized or close to it?
+        # Better to just average and then normalize if needed.
+        mean_embedding = np.mean(embeddings_matrix, axis=0)
+        # result_embeddings[speaker] = mean_embedding.tolist()
+        
+        # Return as list
+        result_embeddings[speaker] = mean_embedding.tolist()
+
+    response.headers["X-Api-Status-Code"] = ASR_STATUS_SUCCESS
+    response.headers["X-Api-Message"] = "OK"
+    return result_embeddings
 
 @app.get("/")
 async def root():

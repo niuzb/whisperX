@@ -24,7 +24,8 @@ dependencies = [
     "torchaudio~=2.8.0",
     "transformers>=4.48.0",
     "uvicorn>=0.30.0",
-    "triton>=3.3.0; sys_platform == 'linux' and platform_machine == 'x86_64'" # only install triton on x86_64 Linux
+    "triton>=3.3.0; sys_platform == 'linux' and platform_machine == 'x86_64'", # only install triton on x86_64 Linux
+    "scikit-learn>=1.0.0"
 ]
 
 
