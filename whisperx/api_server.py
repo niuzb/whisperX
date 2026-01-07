@@ -765,7 +765,7 @@ async def extract_embeddings(
 
 @app.get("/")
 async def root():
-    return {"message": "WhisperX API Server is running"}
+    return {"message": "Server is running"}
 
 
 if __name__ == "__main__":
