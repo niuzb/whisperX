@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
-from pyannote.audio import Pipeline
-from typing import Optional, Union
+from pyannote.audio import Pipeline, Model, Inference
+from typing import Optional, Union, List, Dict
 import torch
 
 from whisperx.audio import load_audio, SAMPLE_RATE
@@ -34,19 +34,6 @@ class DiarizationPipeline:
     ) -> Union[tuple[pd.DataFrame, Optional[dict[str, list[float]]]], pd.DataFrame]:
         """
         Perform speaker diarization on audio.
-
-        Args:
-            audio: Path to audio file or audio array
-            num_speakers: Exact number of speakers (if known)
-            min_speakers: Minimum number of speakers to detect
-            max_speakers: Maximum number of speakers to detect
-            return_embeddings: Whether to return speaker embeddings
-
-        Returns:
-            If return_embeddings is True:
-                Tuple of (diarization dataframe, speaker embeddings dictionary)
-            Otherwise:
-                Just the diarization dataframe
         """
         if isinstance(audio, str):
             audio = load_audio(audio)
@@ -87,6 +74,45 @@ class DiarizationPipeline:
             return diarize_df
 
 
+class SpeechEmbeddingPipeline:
+    def __init__(
+        self,
+        model_name: str = "pyannote/wespeaker-voxceleb-resnet34-LM",
+        use_auth_token: Optional[str] = None,
+        device: Optional[Union[str, torch.device]] = "cpu"
+    ):
+        if isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
+        
+        logger.info(f"Loading embedding model: {model_name}")
+        self.model = Model.from_pretrained(model_name, use_auth_token=use_auth_token)
+        self.model = self.model.to(device)
+        self.inference = Inference(self.model, window="whole")
+
+    def __call__(self, audio_segment: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+        """
+        Extract embedding from an audio segment.
+        Args:
+            audio_segment: numpy array or torch tensor of shape (1, num_samples) or (num_samples,)
+        """
+        if isinstance(audio_segment, np.ndarray):
+            if audio_segment.ndim == 1:
+                audio_segment = audio_segment[None, :]
+            waveform = torch.from_numpy(audio_segment).float()
+        else:
+            if audio_segment.ndim == 1:
+                waveform = audio_segment.unsqueeze(0)
+            else:
+                waveform = audio_segment
+        
+        waveform = waveform.to(self.device)
+        # pyannote Inference expects tensor of shape (1, time)
+        with torch.no_grad():
+            embedding = self.inference({"waveform": waveform, "sample_rate": SAMPLE_RATE})
+        return embedding
+
+
 def assign_word_speakers(
     diarize_df: pd.DataFrame,
     transcript_result: Union[AlignedTranscriptionResult, TranscriptionResult],
@@ -95,15 +121,6 @@ def assign_word_speakers(
 ) -> Union[AlignedTranscriptionResult, TranscriptionResult]:
     """
     Assign speakers to words and segments in the transcript.
-
-    Args:
-        diarize_df: Diarization dataframe from DiarizationPipeline
-        transcript_result: Transcription result to augment with speaker labels
-        speaker_embeddings: Optional dictionary mapping speaker IDs to embedding vectors
-        fill_nearest: If True, assign speakers even when there's no direct time overlap
-
-    Returns:
-        Updated transcript_result with speaker assignments and optionally embeddings
     """
     transcript_segments = transcript_result["segments"]
     for seg in transcript_segments:
