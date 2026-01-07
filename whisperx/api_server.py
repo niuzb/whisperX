@@ -1,22 +1,16 @@
 import asyncio
-import base64
 import os
+import signal
+import sys
 import tempfile
-import time
-import uuid
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from collections import defaultdict
 
-from fastapi import Body, FastAPI, Header, Request, Response
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+import aiohttp
 
 # For Clustering
 import numpy as np
 from sklearn.cluster import DBSCAN
-
-app = FastAPI()
 
 from whisperx.log_utils import get_logger
 from whisperx.diarize import DiarizationPipeline, assign_word_speakers, SpeechEmbeddingPipeline
@@ -32,70 +26,12 @@ ASR_STATUS_NO_SPEECH = "20000003"
 ASR_STATUS_INVALID_PARAMS = "45000001"
 ASR_STATUS_SYSTEM_ERROR = "55000000"
 
+# Configuration
+TASK_SERVER_URL = os.environ.get("TASK_SERVER_URL", "http://127.0.0.1:443")
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 
-class SubmitUser(BaseModel):
-    uid: Optional[str] = None
-
-
-class SubmitAudio(BaseModel):
-    # 客户端会传 base64: requestData.audio.data
-    data: Optional[str] = None
-    # 兼容：如果未来改为传 URL
-    url: Optional[str] = None
-
-
-class SubmitRequest(BaseModel):
-    # 客户端字段名是 request.model_name（来自 SpeechToTextConfig.MODEL_NAME）
-    # 这里把它当作 whisper / faster-whisper 的模型名使用；不传则用默认值
-    model_name: Optional[str] = None
-
-    # 以下字段来自客户端
-    enable_itn: Optional[bool] = None
-    enable_punc: Optional[bool] = None
-    enable_speaker_info: Optional[bool] = None  # Controls Diarization
-    enable_ddc: Optional[bool] = None
-    show_utterances: Optional[bool] = None
-    enable_lid: Optional[bool] = None
-    context: Optional[str] = None
-    
-    # New fields for diarization control
-    min_speakers: Optional[int] = None
-    max_speakers: Optional[int] = None
-
-
-class TaskSubmission(BaseModel):
-    user: Optional[SubmitUser] = None
-    audio: SubmitAudio
-    request: Optional[SubmitRequest] = None
-
-
-class SpeakerSegment(BaseModel):
-    speaker: str
-    start_time: float
-    end_time: float
-
-
-class ExtractEmbeddingRequest(BaseModel):
-    audio: SubmitAudio
-    segments: List[SpeakerSegment]
-    min_duration: Optional[float] = 0.5
-
-
-@dataclass
-class TaskState:
-    status_code: str
-    created_at: float
-    updated_at: float
-    request_id: Optional[str] = None
-    model_name: Optional[str] = None
-    result: Optional[Dict[str, Any]] = None
-    error_message: Optional[str] = None
-    request_params: Optional[SubmitRequest] = None
-
-
-# In-memory task store & queue (进程内；重启会丢失)
-TASKS: Dict[str, TaskState] = {}
-TASK_QUEUE: "asyncio.Queue[str]" = asyncio.Queue()
+# Global flag for graceful shutdown
+_shutdown_flag = False
 
 # Lazy-loaded pipelines
 _PIPELINE = None
@@ -348,426 +284,457 @@ def _run_transcribe_sync(model_name: str, audio_path: str, diarize_params: Dict[
     return payload
 
 
-async def _task_worker():
+async def fetch_task(session: aiohttp.ClientSession, task_type: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
     """
-    后台任务 worker
+    从服务器获取任务，带重试机制
     """
-    loop = asyncio.get_running_loop()
-    logger.info("Task worker started")
-    while True:
-        task_id = await TASK_QUEUE.get()
-        state = TASKS.get(task_id)
-        if state is None:
-            logger.warning(f"Task {task_id} not found in state store")
-            TASK_QUEUE.task_done()
-            continue
-
+    url = f"{TASK_SERVER_URL}/v1/task/worker/fetch_task"
+    params = {"type": task_type}
+    
+    for attempt in range(max_retries):
         try:
-            logger.info(f"Processing task {task_id}")
-            state.status_code = ASR_STATUS_PROCESSING
-            state.updated_at = time.time()
-
-            model_name = state.model_name or os.environ.get("WHISPERX_MODEL", "small")
-            
-            # Prepare Diarization
-            request_params = state.request_params
-            enable_diarization = request_params.enable_speaker_info if request_params else False
-            
-            hf_token = os.environ.get("HF_TOKEN")
-            if enable_diarization:
-                if not hf_token:
-                    logger.warning("Diarization requested but HF_TOKEN is missing. Skipping diarization.")
-                    enable_diarization = False
-                else:
-                    await _ensure_diarize_pipeline("pyannote/speaker-diarization-3.1", hf_token)
-
-            tmp_path = getattr(state, "_tmp_audio_path", None)
-            if not tmp_path or not os.path.exists(tmp_path):
-                raise RuntimeError("audio file missing for task")
-
-            logger.info(f"Ensuring pipeline for model {model_name}")
-            await _ensure_pipeline(model_name)
-            
-            diarize_params = {
-                "enable": enable_diarization,
-                "min_speakers": request_params.min_speakers if request_params else None,
-                "max_speakers": request_params.max_speakers if request_params else None,
-            }
-
-            payload = await loop.run_in_executor(
-                None,
-                _run_transcribe_sync,
-                model_name,
-                tmp_path,
-                diarize_params
-            )
-
-            text = ((payload.get("result") or {}).get("text") or "").strip().lower()
-            if text == "no speech detected":
-                logger.info(f"Task {task_id} finished: No speech detected")
-                state.status_code = ASR_STATUS_NO_SPEECH
-            else:
-                logger.info(f"Task {task_id} finished successfully")
-                state.status_code = ASR_STATUS_SUCCESS
-
-            state.result = payload
-            state.error_message = None
-            state.updated_at = time.time()
-
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status != 200:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Failed to fetch task: HTTP {response.status}, retrying... ({attempt + 1}/{max_retries})")
+                        await asyncio.sleep(1)
+                        continue
+                    logger.warning(f"Failed to fetch task: HTTP {response.status}")
+                    return None
+                
+                data = await response.json()
+                if not data.get("success"):
+                    # No task available (not an error)
+                    return None
+                
+                task_data = data.get("data", {})
+                if not task_data.get("task_id"):
+                    return None
+                
+                return task_data
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                logger.warning(f"Timeout while fetching {task_type} task, retrying... ({attempt + 1}/{max_retries})")
+                await asyncio.sleep(1)
+                continue
+            logger.warning(f"Timeout while fetching {task_type} task after {max_retries} attempts")
+            return None
         except Exception as e:
-            logger.error(f"Task {task_id} failed: {e}", exc_info=True)
-            state.status_code = ASR_STATUS_SYSTEM_ERROR
-            state.error_message = str(e)
-            state.result = None
-            state.updated_at = time.time()
-        finally:
-            tmp_path = getattr(state, "_tmp_audio_path", None)
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-            if tmp_path:
-                try:
-                    delattr(state, "_tmp_audio_path")
-                except Exception:
-                    pass
-            TASK_QUEUE.task_done()
+            if attempt < max_retries - 1:
+                logger.warning(f"Error fetching {task_type} task: {e}, retrying... ({attempt + 1}/{max_retries})")
+                await asyncio.sleep(1)
+                continue
+            logger.error(f"Error fetching {task_type} task after {max_retries} attempts: {e}", exc_info=True)
+            return None
+    
+    return None
 
 
-@app.on_event("startup")
-async def _startup():
-    asyncio.create_task(_task_worker())
+async def submit_result(session: aiohttp.ClientSession, task_id: str, status_code: str, 
+                        result: Optional[Dict[str, Any]] = None, error_message: Optional[str] = None,
+                        max_retries: int = 3) -> bool:
+    """
+    提交任务结果到服务器，带重试机制
+    """
+    url = f"{TASK_SERVER_URL}/v1/task/worker/submit_result"
+    payload = {
+        "task_id": task_id,
+        "status_code": status_code,
+    }
+    if result is not None:
+        payload["result"] = result
+    if error_message is not None:
+        payload["error_message"] = error_message
+    
+    for attempt in range(max_retries):
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status != 200:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Failed to submit result for task {task_id}: HTTP {response.status}, retrying... ({attempt + 1}/{max_retries})")
+                        await asyncio.sleep(1)
+                        continue
+                    logger.error(f"Failed to submit result for task {task_id}: HTTP {response.status}")
+                    return False
+                
+                data = await response.json()
+                return data.get("success", False)
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                logger.warning(f"Timeout while submitting result for task {task_id}, retrying... ({attempt + 1}/{max_retries})")
+                await asyncio.sleep(1)
+                continue
+            logger.error(f"Timeout while submitting result for task {task_id} after {max_retries} attempts")
+            return False
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Error submitting result for task {task_id}: {e}, retrying... ({attempt + 1}/{max_retries})")
+                await asyncio.sleep(1)
+                continue
+            logger.error(f"Error submitting result for task {task_id} after {max_retries} attempts: {e}", exc_info=True)
+            return False
+    
+    return False
 
 
-@app.middleware("http")
-async def add_custom_headers(request: Request, call_next):
-    log_id = request.headers.get("X-Tt-Logid", str(uuid.uuid4()))
+async def download_audio(session: aiohttp.ClientSession, audio_url: str, output_path: str, max_retries: int = 3) -> bool:
+    """
+    从 URL 下载音频文件到指定路径，带重试机制
+    """
+    for attempt in range(max_retries):
+        try:
+            async with session.get(audio_url, timeout=aiohttp.ClientTimeout(total=300)) as response:
+                if response.status != 200:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Failed to download audio: HTTP {response.status}, retrying... ({attempt + 1}/{max_retries})")
+                        await asyncio.sleep(2)
+                        continue
+                    logger.error(f"Failed to download audio: HTTP {response.status}")
+                    return False
+                
+                with open(output_path, "wb") as f:
+                    async for chunk in response.content.iter_chunked(8192):
+                        f.write(chunk)
+                
+                return True
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                logger.warning(f"Timeout while downloading audio from {audio_url}, retrying... ({attempt + 1}/{max_retries})")
+                await asyncio.sleep(2)
+                continue
+            logger.error(f"Timeout while downloading audio from {audio_url} after {max_retries} attempts")
+            return False
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Error downloading audio from {audio_url}: {e}, retrying... ({attempt + 1}/{max_retries})")
+                await asyncio.sleep(2)
+                continue
+            logger.error(f"Error downloading audio from {audio_url} after {max_retries} attempts: {e}", exc_info=True)
+            return False
+    
+    return False
+
+
+async def process_submit_task(session: aiohttp.ClientSession, task_data: Dict[str, Any]) -> None:
+    """
+    处理 submit 类型的任务（转写）
+    """
+    task_id = task_data.get("task_id")
+    task_input = task_data.get("input", {})
+    audio_url = task_input.get("audio_url")
+    
+    if not audio_url:
+        logger.error(f"Task {task_id}: Missing audio_url in input")
+        await submit_result(session, task_id, ASR_STATUS_INVALID_PARAMS, 
+                           error_message="Missing audio_url in task input")
+        return
+    
+    # 获取请求参数
+    request_params = task_input.get("request", {})
+    model_name = request_params.get("model_name") or os.environ.get("WHISPERX_MODEL", "small")
+    enable_diarization = request_params.get("enable_speaker_info", False)
+    
+    tmp_path = None
     try:
-        response = await call_next(request)
-
-        if "X-Tt-Logid" not in response.headers:
-            response.headers["X-Tt-Logid"] = log_id
-
-        if "X-Api-Status-Code" not in response.headers:
-            if 200 <= response.status_code < 300:
-                response.headers["X-Api-Status-Code"] = ASR_STATUS_SUCCESS
-                response.headers["X-Api-Message"] = "OK"
+        logger.info(f"Processing submit task {task_id}")
+        
+        # 下载音频文件
+        fd, tmp_path = tempfile.mkstemp(prefix="whisperx_", suffix=".audio")
+        os.close(fd)
+        
+        logger.info(f"Downloading audio from {audio_url}")
+        if not await download_audio(session, audio_url, tmp_path):
+            raise RuntimeError("Failed to download audio file")
+        
+        # 准备 Diarization
+        hf_token = os.environ.get("HF_TOKEN")
+        if enable_diarization:
+            if not hf_token:
+                logger.warning("Diarization requested but HF_TOKEN is missing. Skipping diarization.")
+                enable_diarization = False
             else:
-                response.headers["X-Api-Status-Code"] = "40000000"
-                response.headers["X-Api-Message"] = "Request Failed"
-
-        if "X-Api-Message" not in response.headers:
-            response.headers["X-Api-Message"] = "OK" if response.headers.get("X-Api-Status-Code") == ASR_STATUS_SUCCESS else "Error"
-
-        return response
+                await _ensure_diarize_pipeline("pyannote/speaker-diarization-3.1", hf_token)
+        
+        # 确保 pipeline 已加载
+        logger.info(f"Ensuring pipeline for model {model_name}")
+        await _ensure_pipeline(model_name)
+        
+        diarize_params = {
+            "enable": enable_diarization,
+            "min_speakers": request_params.get("min_speakers"),
+            "max_speakers": request_params.get("max_speakers"),
+        }
+        
+        # 执行转写
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(
+            None,
+            _run_transcribe_sync,
+            model_name,
+            tmp_path,
+            diarize_params
+        )
+        
+        # 判断结果
+        text = ((payload.get("result") or {}).get("text") or "").strip().lower()
+        if text == "no speech detected":
+            logger.info(f"Task {task_id} finished: No speech detected")
+            status_code = ASR_STATUS_NO_SPEECH
+        else:
+            logger.info(f"Task {task_id} finished successfully")
+            status_code = ASR_STATUS_SUCCESS
+        
+        # 提交结果
+        await submit_result(session, task_id, status_code, result=payload)
+        
     except Exception as e:
-        resp = JSONResponse(content={"detail": str(e)}, status_code=500)
-        resp.headers["X-Tt-Logid"] = log_id
-        resp.headers["X-Api-Status-Code"] = ASR_STATUS_SYSTEM_ERROR
-        resp.headers["X-Api-Message"] = str(e)
-        return resp
+        logger.error(f"Task {task_id} failed: {e}", exc_info=True)
+        await submit_result(session, task_id, ASR_STATUS_SYSTEM_ERROR, 
+                           error_message=str(e))
+    finally:
+        # 清理临时文件
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
-@app.post("/submit")
-async def submit_task(
-    response: Response,
-    payload: TaskSubmission,
-    x_api_request_id: Optional[str] = Header(None, alias="X-Api-Request-Id"),
-):
-    if not payload.audio or not payload.audio.data:
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
-        response.headers["X-Api-Message"] = "Missing audio.data (base64)"
-        return {}
-
-    task_id = str(uuid.uuid4())
-    now = time.time()
-    model_name = "tiny"
-    TASKS[task_id] = TaskState(
-        status_code=ASR_STATUS_IN_QUEUE,
-        created_at=now,
-        updated_at=now,
-        request_id=x_api_request_id,
-        model_name=model_name,
-        result=None,
-        error_message=None,
-        request_params=payload.request,  # Store request params
-    )
-
-    try:
-        audio_bytes = base64.b64decode(payload.audio.data, validate=False)
-    except Exception:
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
-        response.headers["X-Api-Message"] = "Invalid base64 in audio.data"
-        TASKS.pop(task_id, None)
-        return {}
-
-    fd, tmp_path = tempfile.mkstemp(prefix="whisperx_", suffix=".audio")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(audio_bytes)
-    except Exception as e:
-        try:
-            os.close(fd)
-        except Exception:
-            pass
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-        TASKS.pop(task_id, None)
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_SYSTEM_ERROR
-        response.headers["X-Api-Message"] = f"Failed to save audio: {e}"
-        return {}
-
-    setattr(TASKS[task_id], "_tmp_audio_path", tmp_path)
-
-    response.headers["X-Tt-Logid"] = task_id
-    response.headers["X-Api-Status-Code"] = ASR_STATUS_SUCCESS
-    response.headers["X-Api-Message"] = "OK"
-
-    await TASK_QUEUE.put(task_id)
-    return {}
-
-
-@app.post("/query")
-async def query_task(
-    response: Response,
-    body: Dict[str, Any] = Body(...),
-    x_tt_logid: Optional[str] = Header(None, alias="X-Tt-Logid"),
-    x_api_request_id: Optional[str] = Header(None, alias="X-Api-Request-Id"),
-):
-    del body
-    task_id = x_tt_logid or None
-    if not task_id:
-        task_id = x_api_request_id or None
-
-    if not task_id:
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
-        response.headers["X-Api-Message"] = "Missing X-Tt-Logid"
-        return {}
-
-    state = TASKS.get(task_id)
-    if state is None:
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
-        response.headers["X-Api-Message"] = "Task Not Found"
-        return {}
-
-    response.headers["X-Api-Status-Code"] = state.status_code
-
-    if state.status_code == ASR_STATUS_SUCCESS:
-        response.headers["X-Api-Message"] = "OK"
-        return state.result or {}
-    if state.status_code == ASR_STATUS_NO_SPEECH:
-        response.headers["X-Api-Message"] = "No speech detected"
-        return state.result or {}
-    if state.status_code == ASR_STATUS_PROCESSING:
-        response.headers["X-Api-Message"] = "Processing"
-        return {}
-    if state.status_code == ASR_STATUS_IN_QUEUE:
-        response.headers["X-Api-Message"] = "In Queue"
-        return {}
-
-    response.headers["X-Api-Message"] = state.error_message or "Failed"
-    return {}
-
-
-@app.post("/extract_embeddings")
-async def extract_embeddings(
-    response: Response,
-    payload: ExtractEmbeddingRequest,
-):
+async def process_embedding_task(session: aiohttp.ClientSession, task_data: Dict[str, Any]) -> None:
     """
-    Extract speaker embeddings from audio segments.
+    处理 embedding 类型的任务（提取说话人 embedding）
     """
+    task_id = task_data.get("task_id")
+    task_input = task_data.get("input", {})
+    audio_url = task_input.get("audio_url")
+    segments = task_input.get("segments", [])
+    min_duration = task_input.get("min_duration", 0.5)
+    
+    if not audio_url:
+        logger.error(f"Task {task_id}: Missing audio_url in input")
+        await submit_result(session, task_id, ASR_STATUS_INVALID_PARAMS,
+                           error_message="Missing audio_url in task input")
+        return
+    
+    if not segments:
+        logger.error(f"Task {task_id}: Missing segments in input")
+        await submit_result(session, task_id, ASR_STATUS_INVALID_PARAMS,
+                           error_message="Missing segments in task input")
+        return
+    
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token:
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
-        response.headers["X-Api-Message"] = "HF_TOKEN not configured"
-        return {}
-
-    if not payload.audio or not payload.audio.data:
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
-        response.headers["X-Api-Message"] = "Missing audio.data (base64)"
-        return {}
-
-    # Decode audio
+        logger.error(f"Task {task_id}: HF_TOKEN not configured")
+        await submit_result(session, task_id, ASR_STATUS_INVALID_PARAMS,
+                           error_message="HF_TOKEN not configured")
+        return
+    
+    tmp_path = None
     try:
-        audio_bytes = base64.b64decode(payload.audio.data, validate=False)
-    except Exception:
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_INVALID_PARAMS
-        response.headers["X-Api-Message"] = "Invalid base64 in audio.data"
-        return {}
-
-    # Save temp file
-    fd, tmp_path = tempfile.mkstemp(prefix="whisperx_embed_", suffix=".audio")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(audio_bytes)
+        logger.info(f"Processing embedding task {task_id}")
         
-        # Load audio using whisperx utility (which uses ffmpeg to load and resample)
-        # Returns numpy array (channels, samples) or (samples,)
-        # load_audio handles resampling to 16000
+        # 下载音频文件
+        fd, tmp_path = tempfile.mkstemp(prefix="whisperx_embed_", suffix=".audio")
+        os.close(fd)
+        
+        logger.info(f"Downloading audio from {audio_url}")
+        if not await download_audio(session, audio_url, tmp_path):
+            raise RuntimeError("Failed to download audio file")
+        
+        # 加载音频
         audio_np = load_audio(tmp_path)
         
-    except Exception as e:
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_SYSTEM_ERROR
-        response.headers["X-Api-Message"] = f"Failed to process audio: {e}"
-        return {}
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-    # Ensure pipeline
-    try:
+        # 确保 embedding pipeline 已加载
         pipeline = await _ensure_embedding_pipeline(hf_token)
-    except Exception as e:
-        logger.error(f"Failed to load embedding pipeline: {e}", exc_info=True)
-        response.headers["X-Api-Status-Code"] = ASR_STATUS_SYSTEM_ERROR
-        response.headers["X-Api-Message"] = f"Failed to load model: {e}"
-        return {}
-
-    # Identify overlapping regions to exclude
-    # A simple timeline mask of overlapping regions
-    # Discretize? No, float is fine.
-    # Sort segments by start time
-    sorted_segments = sorted(payload.segments, key=lambda x: x.start_time)
-    
-    # Find overlap intervals
-    overlaps = []
-    if len(sorted_segments) > 1:
-        # Check overlaps
-        # Basic sweep-line
-        events = []
-        for s in sorted_segments:
-            events.append((s.start_time, 1))
-            events.append((s.end_time, -1))
-        events.sort(key=lambda x: x[0])
         
-        active_count = 0
-        start_overlap = None
+        # 处理 segments（从 extract_embeddings 逻辑中提取）
+        sorted_segments = sorted(segments, key=lambda x: x.get("start_time", 0))
         
-        for t, change in events:
-            prev_active = active_count
-            active_count += change
+        # 查找重叠区间
+        overlaps = []
+        if len(sorted_segments) > 1:
+            events = []
+            for s in sorted_segments:
+                events.append((s.get("start_time", 0), 1))
+                events.append((s.get("end_time", 0), -1))
+            events.sort(key=lambda x: x[0])
             
-            if prev_active < 2 and active_count >= 2:
-                # Started overlap
-                start_overlap = t
-            elif prev_active >= 2 and active_count < 2:
-                # Ended overlap
-                if start_overlap is not None:
-                    overlaps.append((start_overlap, t))
-                    start_overlap = None
-
-    # Group segments by speaker
-    speaker_segments = defaultdict(list)
-    for seg in payload.segments:
-        # Filter too short segments
-        if (seg.end_time - seg.start_time) < (payload.min_duration or 0.5):
-            continue
-        speaker_segments[seg.speaker].append(seg)
-
-    result_embeddings = {}
-
-    for speaker, segments in speaker_segments.items():
-        embeddings_list = []
+            active_count = 0
+            start_overlap = None
+            
+            for t, change in events:
+                prev_active = active_count
+                active_count += change
+                
+                if prev_active < 2 and active_count >= 2:
+                    start_overlap = t
+                elif prev_active >= 2 and active_count < 2:
+                    if start_overlap is not None:
+                        overlaps.append((start_overlap, t))
+                        start_overlap = None
         
+        # 按说话人分组
+        speaker_segments = defaultdict(list)
         for seg in segments:
-            # Construct time intervals for this segment, subtracting overlaps
-            # Valid intervals = [seg.start, seg.end] - overlaps
-            # This is 1D boolean logic.
+            duration = seg.get("end_time", 0) - seg.get("start_time", 0)
+            if duration < min_duration:
+                continue
+            speaker_segments[seg.get("speaker", "1")].append(seg)
+        
+        result_embeddings = {}
+        
+        for speaker, segs in speaker_segments.items():
+            embeddings_list = []
             
-            # Start with the full segment
-            valid_intervals = [(seg.start_time, seg.end_time)]
-            
-            for o_start, o_end in overlaps:
-                new_intervals = []
+            for seg in segs:
+                valid_intervals = [(seg.get("start_time", 0), seg.get("end_time", 0))]
+                
+                for o_start, o_end in overlaps:
+                    new_intervals = []
+                    for v_start, v_end in valid_intervals:
+                        if o_end <= v_start or o_start >= v_end:
+                            new_intervals.append((v_start, v_end))
+                        else:
+                            if v_start < o_start:
+                                new_intervals.append((v_start, o_start))
+                            if v_end > o_end:
+                                new_intervals.append((o_end, v_end))
+                    valid_intervals = new_intervals
+                
                 for v_start, v_end in valid_intervals:
-                    # No overlap
-                    if o_end <= v_start or o_start >= v_end:
-                        new_intervals.append((v_start, v_end))
-                    else:
-                        # Overlap exists
-                        # Left part
-                        if v_start < o_start:
-                            new_intervals.append((v_start, o_start))
-                        # Right part
-                        if v_end > o_end:
-                            new_intervals.append((o_end, v_end))
-                valid_intervals = new_intervals
-            
-            # Process valid intervals
-            for v_start, v_end in valid_intervals:
-                if (v_end - v_start) < (payload.min_duration or 0.5):
-                    continue
-                
-                # Crop audio
-                start_sample = int(v_start * SAMPLE_RATE)
-                end_sample = int(v_end * SAMPLE_RATE)
-                
-                if end_sample > audio_np.shape[0]:
-                    end_sample = audio_np.shape[0]
-                if start_sample >= end_sample:
-                    continue
+                    if (v_end - v_start) < min_duration:
+                        continue
                     
-                crop = audio_np[start_sample:end_sample]
-                try:
-                    emb = pipeline(crop)
-                    # emb shape is (1, dimension) or (dimension,) depending on pyannote version
-                    # Usually it's (dimension,) for a single embedding or (1, D)
-                    if isinstance(emb, np.ndarray):
-                        emb = emb.flatten()
-                        embeddings_list.append(emb)
-                except Exception as e:
-                    logger.warning(f"Failed to extract embedding for speaker {speaker}: {e}")
-
-        if not embeddings_list:
-            continue
-
-        # Clustering / Averaging
-        embeddings_matrix = np.array(embeddings_list)
+                    start_sample = int(v_start * SAMPLE_RATE)
+                    end_sample = int(v_end * SAMPLE_RATE)
+                    
+                    if end_sample > audio_np.shape[0]:
+                        end_sample = audio_np.shape[0]
+                    if start_sample >= end_sample:
+                        continue
+                    
+                    crop = audio_np[start_sample:end_sample]
+                    try:
+                        emb = pipeline(crop)
+                        if isinstance(emb, np.ndarray):
+                            emb = emb.flatten()
+                            embeddings_list.append(emb)
+                    except Exception as e:
+                        logger.warning(f"Failed to extract embedding for speaker {speaker}: {e}")
+            
+            if not embeddings_list:
+                continue
+            
+            embeddings_matrix = np.array(embeddings_list)
+            
+            if len(embeddings_list) >= 3:
+                clustering = DBSCAN(eps=0.5, min_samples=2, metric='cosine').fit(embeddings_matrix)
+                labels = clustering.labels_
+                
+                unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
+                
+                if len(unique_labels) > 0:
+                    largest_cluster_label = unique_labels[np.argmax(counts)]
+                    embeddings_matrix = embeddings_matrix[labels == largest_cluster_label]
+            
+            mean_embedding = np.mean(embeddings_matrix, axis=0)
+            result_embeddings[speaker] = mean_embedding.tolist()
         
-        # If we have enough samples, use DBSCAN to filter outliers
-        # DBSCAN metric='cosine'. eps needs to be small enough (cosine distance)
-        # Cosine distance = 1 - cosine similarity. 
-        # Same speaker similarity is usually > 0.5 or 0.7. So distance < 0.3 or 0.5.
-        if len(embeddings_list) >= 3:
-            # eps=0.5 corresponds to similarity 0.5
-            clustering = DBSCAN(eps=0.5, min_samples=2, metric='cosine').fit(embeddings_matrix)
-            labels = clustering.labels_
-            
-            # Find largest cluster (excluding noise -1)
-            unique_labels, counts = np.unique(labels[labels >= 0], return_counts=True)
-            
-            if len(unique_labels) > 0:
-                largest_cluster_label = unique_labels[np.argmax(counts)]
-                # Filter embeddings belonging to the largest cluster
-                embeddings_matrix = embeddings_matrix[labels == largest_cluster_label]
-            else:
-                # All noise? Fallback to mean of all
+        logger.info(f"Task {task_id} finished successfully")
+        await submit_result(session, task_id, ASR_STATUS_SUCCESS, result=result_embeddings)
+        
+    except Exception as e:
+        logger.error(f"Task {task_id} failed: {e}", exc_info=True)
+        await submit_result(session, task_id, ASR_STATUS_SYSTEM_ERROR,
+                           error_message=str(e))
+    finally:
+        # 清理临时文件
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
                 pass
-        
-        # Calculate mean embedding (centroid)
-        # Normalize first? Pyannote embeddings are usually unit normalized or close to it?
-        # Better to just average and then normalize if needed.
-        mean_embedding = np.mean(embeddings_matrix, axis=0)
-        # result_embeddings[speaker] = mean_embedding.tolist()
-        
-        # Return as list
-        result_embeddings[speaker] = mean_embedding.tolist()
 
-    response.headers["X-Api-Status-Code"] = ASR_STATUS_SUCCESS
-    response.headers["X-Api-Message"] = "OK"
-    return result_embeddings
 
-@app.get("/")
-async def root():
-    return {"message": "Server is running"}
+async def process_task(session: aiohttp.ClientSession, task_data: Dict[str, Any]) -> None:
+    """
+    根据任务类型处理任务
+    """
+    task_type = task_data.get("type", "submit")
+    
+    if task_type == "submit":
+        await process_submit_task(session, task_data)
+    elif task_type == "embedding":
+        await process_embedding_task(session, task_data)
+    else:
+        logger.warning(f"Unknown task type: {task_type}")
+        task_id = task_data.get("task_id", "unknown")
+        await submit_result(session, task_id, ASR_STATUS_INVALID_PARAMS,
+                           error_message=f"Unknown task type: {task_type}")
+
+
+async def main_loop():
+    """
+    主轮询循环
+    """
+    global _shutdown_flag
+    
+    logger.info("Starting WhisperX worker")
+    logger.info(f"Server URL: {TASK_SERVER_URL}")
+    logger.info(f"Poll interval: {POLL_INTERVAL} seconds")
+    
+    async with aiohttp.ClientSession() as session:
+        while not _shutdown_flag:
+            try:
+                # 轮询 submit 任务
+                submit_task = await fetch_task(session, "submit")
+                if submit_task:
+                    logger.info(f"Fetched submit task: {submit_task.get('task_id')}")
+                    await process_task(session, submit_task)
+                    # 处理完任务后立即继续，不等待
+                    continue
+                
+                # 轮询 embedding 任务
+                embedding_task = await fetch_task(session, "embedding")
+                if embedding_task:
+                    logger.info(f"Fetched embedding task: {embedding_task.get('task_id')}")
+                    await process_task(session, embedding_task)
+                    # 处理完任务后立即继续，不等待
+                    continue
+                
+                # 没有任务，等待一段时间
+                await asyncio.sleep(POLL_INTERVAL)
+                
+            except KeyboardInterrupt:
+                logger.info("Received keyboard interrupt, shutting down...")
+                _shutdown_flag = True
+                break
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}", exc_info=True)
+                await asyncio.sleep(POLL_INTERVAL)
+    
+    logger.info("Worker stopped")
+
+
+def signal_handler(signum, frame):
+    """
+    信号处理函数，用于优雅退出
+    """
+    global _shutdown_flag
+    logger.info(f"Received signal {signum}, shutting down...")
+    _shutdown_flag = True
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+    # 注册信号处理
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # 运行主循环
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        logger.info("Worker interrupted by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
