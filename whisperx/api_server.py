@@ -246,7 +246,8 @@ def _run_transcribe_sync(model_name: str, audio_path: str, diarize_params: Dict[
                 max_speakers=max_speakers,
                 return_embeddings=True
             )
-            
+            logger.info(f"Diarized segments for task id: {(diarize_segments)}")
+            logger.info(f"asr result: {result}")
             result = assign_word_speakers(diarize_segments, result, speaker_embeddings)
             # Update segments variable as it might be modified in place or we should re-read it
             segments = result.get("segments") or []
@@ -280,7 +281,8 @@ def _run_transcribe_sync(model_name: str, audio_path: str, diarize_params: Dict[
     # Include speaker embeddings if present
     if "speaker_embeddings" in result:
         payload["result"]["speaker_embeddings"] = result["speaker_embeddings"]
-
+    #print embedding shape
+    logger.info(f"speaker_embeddings shape: {result['speaker_embeddings'].shape}")
     return payload
 
 
@@ -429,9 +431,11 @@ async def process_submit_task(session: aiohttp.ClientSession, task_data: Dict[st
                            error_message="Missing audio_url in task input")
         return
     
+    logger.info(f"Task {task_id}: Received submit task with task_data: {task_data}")
     # 获取请求参数
     request_params = task_input.get("request", {})
-    model_name = request_params.get("model_name") or os.environ.get("WHISPERX_MODEL", "small")
+    
+    model_name =  os.environ.get("WHISPERX_MODEL", "small")
     enable_diarization = request_params.get("enable_speaker_info", False)
     
     tmp_path = None
