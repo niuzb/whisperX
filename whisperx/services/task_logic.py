@@ -22,6 +22,7 @@ from .inference import (
     ensure_embedding_pipeline,
     run_transcribe_sync,
     compute_speaker_embedding,
+    run_diarization_sync,
 )
 
 logger = get_logger(__name__)
@@ -130,12 +131,6 @@ async def process_embedding_task(session: Any, task_data: Dict[str, Any]) -> Non
                            error_message="Missing audio_url in task input")
         return
     
-    if not segments:
-        logger.error(f"Task {task_id}: Missing segments in input")
-        await submit_result(session, task_id, ASR_STATUS_INVALID_PARAMS,
-                           error_message="Missing segments in task input")
-        return
-    
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token:
         logger.error(f"Task {task_id}: HF_TOKEN not configured")
@@ -155,6 +150,27 @@ async def process_embedding_task(session: Any, task_data: Dict[str, Any]) -> Non
         if not await download_audio(session, audio_url, tmp_path):
             raise RuntimeError("Failed to download audio file")
         
+        if not segments:
+            logger.info(f"Task {task_id}: No segments provided. Running diarization...")
+            await ensure_diarize_pipeline("pyannote/speaker-diarization-3.1", hf_token)
+            
+            loop = asyncio.get_running_loop()
+            min_speakers = task_input.get("min_speakers")
+            max_speakers = task_input.get("max_speakers")
+            
+            segments = await loop.run_in_executor(
+                None,
+                run_diarization_sync,
+                tmp_path,
+                min_speakers,
+                max_speakers
+            )
+            
+            if not segments:
+                logger.info(f"Task {task_id}: Diarization found no segments.")
+                await submit_result(session, task_id, ASR_STATUS_SUCCESS, result={})
+                return
+
         # 加载音频
         audio_np = load_audio(tmp_path)
         

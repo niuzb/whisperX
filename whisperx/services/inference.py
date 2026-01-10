@@ -173,6 +173,32 @@ def run_transcribe_sync(model_name: str, audio_path: str, diarize_params: Dict[s
     return payload
 
 
+def run_diarization_sync(audio_path: str, min_speakers: Optional[int] = None, max_speakers: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Run diarization only and return segments.
+    """
+    if _DIARIZE_PIPELINE is None:
+        raise RuntimeError("Diarization Pipeline not initialized")
+
+    audio = load_audio(audio_path)
+    
+    diarize_segments = _DIARIZE_PIPELINE(
+        audio,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        return_embeddings=False
+    )
+    
+    results = []
+    for _, row in diarize_segments.iterrows():
+        results.append({
+            "start_time": row['start'],
+            "end_time": row['end'],
+            "speaker": row['speaker']
+        })
+    return results
+
+
 def compute_speaker_embedding(embeddings_list: List[np.ndarray]) -> List[float]:
     """
     Cluster and compute mean embedding for a speaker.
